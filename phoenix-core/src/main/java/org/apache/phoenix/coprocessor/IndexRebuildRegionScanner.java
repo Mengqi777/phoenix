@@ -19,6 +19,7 @@ package org.apache.phoenix.coprocessor;
 
 import static org.apache.phoenix.hbase.index.IndexRegionObserver.UNVERIFIED_BYTES;
 import static org.apache.phoenix.hbase.index.IndexRegionObserver.VERIFIED_BYTES;
+import static org.apache.phoenix.hbase.index.IndexRegionObserver.removeEmptyColumn;
 import static org.apache.phoenix.hbase.index.write.AbstractParallelWriterIndexCommitter.INDEX_WRITER_KEEP_ALIVE_TIME_CONF_KEY;
 import static org.apache.phoenix.mapreduce.index.IndexTool.AFTER_REBUILD_EXPIRED_INDEX_ROW_COUNT_BYTES;
 import static org.apache.phoenix.mapreduce.index.IndexTool.AFTER_REBUILD_INVALID_INDEX_ROW_COUNT_BYTES;
@@ -424,7 +425,7 @@ public class IndexRebuildRegionScanner extends BaseRegionScanner {
                 hTableFactory = ServerUtil.getDelegateHTableFactory(env, ServerUtil.ConnectionType.INDEX_WRITER_CONNECTION);
                 indexHTable = hTableFactory.getTable(new ImmutableBytesPtr(indexMaintainer.getIndexTableName()));
                 indexTableTTL = indexHTable.getTableDescriptor().getColumnFamilies()[0].getTimeToLive();
-		outputHTable = hTableFactory.getTable(new ImmutableBytesPtr(IndexTool.OUTPUT_TABLE_NAME_BYTES));
+                outputHTable = hTableFactory.getTable(new ImmutableBytesPtr(IndexTool.OUTPUT_TABLE_NAME_BYTES));
                 resultHTable = hTableFactory.getTable(new ImmutableBytesPtr(IndexTool.RESULT_TABLE_NAME_BYTES));
                 indexKeyToMutationMap = Maps.newTreeMap(Bytes.BYTES_COMPARATOR);
                 dataKeyToMutationMap = Maps.newTreeMap(Bytes.BYTES_COMPARATOR);
@@ -689,7 +690,7 @@ public class IndexRebuildRegionScanner extends BaseRegionScanner {
         return null;
     }
 
-    private boolean isMatchingMutation(Mutation expected, Mutation actual, int version) throws IOException {
+    private boolean isMatchingMutation(Mutation expected, Mutation actual, int iteration) throws IOException {
         if (getTimestamp(expected) != getTimestamp(actual)) {
             String errorMsg = "Not matching timestamp";
             byte[] dataKey = indexMaintainer.buildDataRowKey(new ImmutableBytesWritable(expected.getRow()), viewConstants);
@@ -708,23 +709,20 @@ public class IndexRebuildRegionScanner extends BaseRegionScanner {
                 if (actualCell == null ||
                         !CellUtil.matchingType(expectedCell, actualCell)) {
                     byte[] dataKey = indexMaintainer.buildDataRowKey(new ImmutableBytesWritable(expected.getRow()), viewConstants);
-                    String errorMsg = "Missing cell (in version " + version + ") " + Bytes.toString(family) + ":" + Bytes.toString(qualifier);
+                    String errorMsg = "Missing cell (in iteration " + iteration + ") " + Bytes.toString(family) + ":" + Bytes.toString(qualifier);
                     logToIndexToolOutputTable(dataKey, expected.getRow(), getTimestamp(expected), getTimestamp(actual), errorMsg);
                     return false;
                 }
                 if (!CellUtil.matchingValue(actualCell, expectedCell)) {
-                    if (Bytes.compareTo(family, indexMaintainer.getEmptyKeyValueFamily().copyBytesIfNecessary()) == 0 &&
-                            Bytes.compareTo(qualifier, indexMaintainer.getEmptyKeyValueQualifier()) == 0) {
-                        if (Bytes.compareTo(actualCell.getValueArray(), actualCell.getValueOffset(), actualCell.getValueLength(),
-                                UNVERIFIED_BYTES, 0, UNVERIFIED_BYTES.length) == 0) {
-                            // We will not flag this as mismatch but will log it
-                            byte[] dataKey = indexMaintainer.buildDataRowKey(new ImmutableBytesWritable(expected.getRow()), viewConstants);
-                            String errorMsg = "Unverified index row (in version " + version + ")";
-                            logToIndexToolOutputTable(dataKey, expected.getRow(), getTimestamp(expected), getTimestamp(actual), errorMsg);
-                            continue;
-                        }
+                    if (verifyType == IndexTool.IndexVerifyType.ONLY &&
+                            (Bytes.compareTo(family, indexMaintainer.getEmptyKeyValueFamily().copyBytesIfNecessary()) == 0 &&
+                            Bytes.compareTo(qualifier, indexMaintainer.getEmptyKeyValueQualifier()) == 0) &&
+                            (Bytes.compareTo(actualCell.getValueArray(), actualCell.getValueOffset(), actualCell.getValueLength(),
+                                UNVERIFIED_BYTES, 0, UNVERIFIED_BYTES.length) == 0)) {
+                        // We do not flag this as mismatch as we can have unverified but still valid rows
+                        continue;
                     }
-                    String errorMsg = "Not matching value (in version " + version + ") for " + Bytes.toString(family) + ":" + Bytes.toString(qualifier);
+                    String errorMsg = "Not matching value (in iteration " + iteration + ") for " + Bytes.toString(family) + ":" + Bytes.toString(qualifier);
                     byte[] dataKey = indexMaintainer.buildDataRowKey(new ImmutableBytesWritable(expected.getRow()), viewConstants);
                     logToIndexToolOutputTable(dataKey, expected.getRow(), getTimestamp(expected), getTimestamp(actual),
                             errorMsg, CellUtil.cloneValue(expectedCell), CellUtil.cloneValue(actualCell));
@@ -963,14 +961,16 @@ public class IndexRebuildRegionScanner extends BaseRegionScanner {
         }
         if ((expectedIndex != expectedSize) || actualIndex != actualSize) {
             if (matchingCount > 0) {
-                // We do not consider this as a verification issue but log it for further information.
-                // This may happen due to compaction
-                byte[] dataKey = indexMaintainer.buildDataRowKey(new ImmutableBytesWritable(indexRow.getRow()), viewConstants);
-                String errorMsg = "Expected to find " + expectedMutationList.size() + " mutations but got "
-                        + actualMutationList.size();
-                logToIndexToolOutputTable(dataKey, indexRow.getRow(),
-                        getTimestamp(expectedMutationList.get(0)),
-                        getTimestamp(actualMutationList.get(0)), errorMsg);
+                if (verifyType != IndexTool.IndexVerifyType.ONLY) {
+                    // We do not consider this as a verification issue but log it for further information.
+                    // This may happen due to compaction
+                    byte[] dataKey = indexMaintainer.buildDataRowKey(new ImmutableBytesWritable(indexRow.getRow()), viewConstants);
+                    String errorMsg = "Expected to find " + expectedMutationList.size() + " mutations but got "
+                            + actualMutationList.size();
+                    logToIndexToolOutputTable(dataKey, indexRow.getRow(),
+                            getTimestamp(expectedMutationList.get(0)),
+                            getTimestamp(actualMutationList.get(0)), errorMsg);
+                }
             } else {
                 byte[] dataKey = indexMaintainer.buildDataRowKey(new ImmutableBytesWritable(indexRow.getRow()), viewConstants);
                 String errorMsg = "Not matching index row";
@@ -1283,6 +1283,9 @@ public class IndexRebuildRegionScanner extends BaseRegionScanner {
             byte[] indexRowKey = indexMaintainer.buildRowKey(mergedRowVG, rowKeyPtr,
                     null, null, HConstants.LATEST_TIMESTAMP);
             indexPut = new Put(indexRowKey);
+        } else {
+            removeEmptyColumn(indexPut, indexMaintainer.getEmptyKeyValueFamily().copyBytesIfNecessary(),
+                    indexMaintainer.getEmptyKeyValueQualifier());
         }
         indexPut.addColumn(indexMaintainer.getEmptyKeyValueFamily().copyBytesIfNecessary(),
                 indexMaintainer.getEmptyKeyValueQualifier(), ts, VERIFIED_BYTES);
